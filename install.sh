@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-#   SIT / 6to4 Tunnel Manager (Final Fixed)
+#  Deterministic SIT / 6to4 Tunnel Manager
 # ==========================================
 
 CONF_DIR="/etc/sit6"
@@ -10,7 +10,7 @@ TUN_PREFIX="sit6"
 
 mkdir -p "$CONF_DIR"
 
-# ---------- UI helpers ----------
+# ---------- Colors ----------
 red()   { echo -e "\e[31m$1\e[0m"; }
 green() { echo -e "\e[32m$1\e[0m"; }
 blue()  { echo -e "\e[36m$1\e[0m"; }
@@ -22,25 +22,17 @@ die() {
 
 # ---------- Checks ----------
 check_root() {
-  [[ $EUID -ne 0 ]] && die "Run this script as root"
+  [[ $EUID -ne 0 ]] && die "Run as root"
 }
 
-detect_role() {
-  CC=$(curl -s ipapi.co/country/)
-  [[ "$CC" == "IR" ]] && echo "IR" || echo "OUT"
-}
-
-# ---------- IPv6 fixes ----------
-fix_ipv6_sysctl() {
-  blue "Configuring IPv6 kernel settings..."
-
+fix_ipv6() {
   sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null
   sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null
   sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
   sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null
 }
 
-persist_sysctl() {
+persist_ipv6() {
   cat <<EOF >/etc/sysctl.d/99-sit6.conf
 net.ipv6.conf.all.disable_ipv6 = 0
 net.ipv6.conf.default.disable_ipv6 = 0
@@ -50,22 +42,99 @@ EOF
   sysctl --system >/dev/null
 }
 
-# ---------- Utils ----------
+# ---------- Deterministic IPv6 ----------
 gen_ipv6_net() {
-  printf "fd%02x:%02x%02x:%02x%02x::/64\n" \
-    $((RANDOM%256)) $((RANDOM%256)) \
-    $((RANDOM%256)) $((RANDOM%256)) \
-    $((RANDOM%256))
+  local ID=$1
+  printf "fd00:%x::/64\n" "$ID"
 }
 
+# ---------- Health ----------
 health_check() {
   local TARGET=$1
-
   blue "Health check: ping6 $TARGET"
-  if ping6 -c 3 -W 2 "$TARGET" &>/dev/null; then
-    green "Tunnel is healthy"
+  ping6 -c 3 -W 2 "$TARGET" &>/dev/null \
+    && green "Tunnel is healthy" \
+    || die "Tunnel is NOT healthy (IPv6 mismatch or remote down)"
+}
+
+# ---------- Core ----------
+create_tunnel() {
+  echo
+  echo "Select server role:"
+  echo "1) Iran"
+  echo "2) Outside"
+  read -p "> " ROLE_SEL
+
+  [[ "$ROLE_SEL" != "1" && "$ROLE_SEL" != "2" ]] && die "Invalid role"
+
+  read -p "Enter tunnel ID (same number on both servers): " TID
+  [[ -z "$TID" || ! "$TID" =~ ^[0-9]+$ ]] && die "Tunnel ID must be a number"
+
+  read -p "Enter IRAN server IPv4: " IR_IP
+  read -p "Enter OUTSIDE server IPv4: " OUT_IP
+
+  IPV6_NET=$(gen_ipv6_net "$TID")
+  TUN="${TUN_PREFIX}${TID}"
+
+  if [[ "$ROLE_SEL" == "1" ]]; then
+    # IRAN
+    LOCAL="$IR_IP"
+    REMOTE="$OUT_IP"
+    IPV6_LOCAL="fd00:${TID}::2/64"
+    TEST_TARGET="fd00:${TID}::1"
   else
-    die "IPv6 is not responding on remote side"
+    # OUTSIDE
+    LOCAL="$OUT_IP"
+    REMOTE="$IR_IP"
+    IPV6_LOCAL="fd00:${TID}::1/64"
+    TEST_TARGET="fd00:${TID}::2"
+  fi
+
+  blue "Creating tunnel $TUN"
+  ip tunnel del "$TUN" 2>/dev/null
+
+  ip tunnel add "$TUN" mode sit local "$LOCAL" remote "$REMOTE" ttl 255 \
+    || die "Failed to create tunnel"
+
+  ip link set "$TUN" up || die "Failed to bring tunnel up"
+  ip -6 addr add "$IPV6_LOCAL" dev "$TUN" || die "Failed to assign IPv6"
+  ip -6 route add "$IPV6_NET" dev "$TUN" 2>/dev/null
+
+  echo "$TUN $IR_IP $OUT_IP $IPV6_NET" > "$DB"
+
+  green "Tunnel created"
+  blue "IPv6 Network : $IPV6_NET"
+  blue "Local IPv6   : $IPV6_LOCAL"
+
+  sleep 1
+  health_check "$TEST_TARGET"
+}
+
+# ---------- UI ----------
+menu() {
+  clear
+  echo -e "\e[35m====================================\e[0m"
+  echo -e "\e[1;35m  Deterministic SIT Tunnel Manager\e[0m"
+  echo -e "\e[35m====================================\e[0m"
+  echo "1) Create / Recreate tunnel"
+  echo "0) Exit"
+  echo
+}
+
+# ---------- MAIN ----------
+check_root
+fix_ipv6
+persist_ipv6
+
+while true; do
+  menu
+  read -p "> " C
+  case "$C" in
+    1) create_tunnel ;;
+    0) exit 0 ;;
+    *) echo "Invalid option"; sleep 1 ;;
+  esac
+done    die "IPv6 is not responding on remote side"
   fi
 }
 
