@@ -1,138 +1,160 @@
+
 #!/bin/bash
 
-CONF_DIR="/etc/sit6"
-TUN_PREFIX="sit6"
-mkdir -p $CONF_DIR
+# ===============================
+#  SIT / 6to4 Tunnel Manager
+#  Fixed + Health Check Edition
+# ===============================
 
-check_root() {
-  [ "$EUID" -ne 0 ] && echo "❌ با root اجرا کن" && exit 1
+CONF_DIR="/etc/sit6"
+DB="$CONF_DIR/tunnels.db"
+TUN_PREFIX="sit6"
+
+mkdir -p "$CONF_DIR"
+
+# ---------- Utils ----------
+die() {
+  echo -e "\e[31m❌ $1\e[0m"
+  exit 1
 }
 
-detect_country() {
-  IP=$(curl -s https://api.ipify.org)
-  CC=$(curl -s ipapi.co/$IP/country/)
-  [ "$CC" = "IR" ] && echo "IR" || echo "OUT"
+ok() {
+  echo -e "\e[32m✔ $1\e[0m"
+}
+
+info() {
+  echo -e "\e[36m➜ $1\e[0m"
+}
+
+check_root() {
+  [[ $EUID -ne 0 ]] && die "اسکریپت باید با root اجرا شود"
+}
+
+detect_role() {
+  local CC
+  CC=$(curl -s ipapi.co/country/)
+  [[ "$CC" == "IR" ]] && echo "IR" || echo "OUT"
 }
 
 gen_ipv6() {
-  printf "fd%02x:%02x%02x:%02x%02x::1/64\n" $RANDOM $RANDOM $RANDOM $RANDOM $RANDOM
+  printf "fd%02x:%02x%02x:%02x%02x::/64\n" \
+    $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) \
+    $((RANDOM%256)) $((RANDOM%256))
 }
 
-load_remote_ip() {
-  # بررسی وجود کانفیگ خارجی آماده
-  if [ -f "$CONF_DIR/remote_ip.conf" ]; then
-    OUT_IP=$(cat $CONF_DIR/remote_ip.conf)
-    echo "🌐 IP سرور خارج: $OUT_IP بارگذاری شد"
+health_check() {
+  local DEV=$1
+  local TARGET=$2
+
+  info "تست سلامت تونل (ping6)"
+  if ping6 -c 3 -W 2 "$TARGET" &>/dev/null; then
+    ok "تونل سالم است"
   else
-    read -p "IP سرور خارج: " OUT_IP
-    echo $OUT_IP > $CONF_DIR/remote_ip.conf
+    die "تونل مشکل دارد (IPv6 پاسخ نمی‌دهد)"
   fi
 }
 
+# ---------- Core ----------
 create_tunnel() {
-  load_remote_ip
   read -p "IP سرور ایران: " IR_IP
+  read -p "IP سرور خارج: " OUT_IP
 
-  ID=$(date +%s)
-  TUN="${TUN_PREFIX}${ID}"
-  IPV6=$(gen_ipv6)
+  [[ -z "$IR_IP" || -z "$OUT_IP" ]] && die "IP ها نباید خالی باشند"
 
-  if [ "$ROLE" = "IR" ]; then
-    LOCAL=$IR_IP
-    REMOTE=$OUT_IP
-    IPV6_LOCAL="${IPV6%/*}2/64"
+  TUN="${TUN_PREFIX}$(date +%s)"
+  IPV6_NET=$(gen_ipv6)
+
+  if [[ "$ROLE" == "IR" ]]; then
+    LOCAL="$IR_IP"
+    REMOTE="$OUT_IP"
+    IPV6_LOCAL="${IPV6_NET%/*}2/64"
+    IPV6_REMOTE="${IPV6_NET%/*}1"
+    TEST_TARGET="$IPV6_REMOTE"
   else
-    LOCAL=$OUT_IP
-    REMOTE=$IR_IP
-    IPV6_LOCAL="${IPV6%/*}1/64"
+    LOCAL="$OUT_IP"
+    REMOTE="$IR_IP"
+    IPV6_LOCAL="${IPV6_NET%/*}1/64"
+    IPV6_REMOTE="${IPV6_NET%/*}2"
+    TEST_TARGET="$IPV6_REMOTE"
   fi
 
-  # ساخت تونل
-  ip tunnel add $TUN mode sit local $LOCAL remote $REMOTE ttl 255
-  ip link set $TUN up
-  ip -6 addr add $IPV6_LOCAL dev $TUN
+  info "ساخت تونل $TUN"
+  ip tunnel add "$TUN" mode sit local "$LOCAL" remote "$REMOTE" ttl 255 || die "خطا در ساخت تونل"
+  ip link set "$TUN" up || die "UP نشد"
+  ip -6 addr add "$IPV6_LOCAL" dev "$TUN" || die "IPv6 ست نشد"
 
-  # ذخیره تونل
-  echo "$TUN $IR_IP $OUT_IP $IPV6" >> $CONF_DIR/tunnels.db
+  echo "$TUN $IR_IP $OUT_IP $IPV6_NET" >> "$DB"
 
-  echo "✅ تانل ساخته شد: $TUN"
-  echo "🌐 IPv6 تانل: ${IPV6%/*}"
+  ok "تونل ساخته شد"
+  info "IPv6 Network: $IPV6_NET"
+  info "IPv6 این سرور: $IPV6_LOCAL"
 
-  # تست اتصال
-  ping -c 2 $REMOTE &>/dev/null && echo "✔️ اتصال به $REMOTE برقرار است" || echo "⚠️ اتصال برقرار نشد"
+  sleep 1
+  health_check "$TUN" "$TEST_TARGET"
 }
 
 list_tunnels() {
-  echo "📡 تانل‌های فعال:"
-  ip tunnel show | grep $TUN_PREFIX
+  echo
+  info "تونل‌های فعال:"
+  ip tunnel show | grep "$TUN_PREFIX" || echo "هیچ تونلی نیست"
+  echo
 }
 
 delete_tunnel() {
   list_tunnels
-  read -p "نام تانل: " TUN
+  read -p "نام تونل برای حذف: " TUN
 
-  ip tunnel del $TUN 2>/dev/null
-  sed -i "/^$TUN /d" $CONF_DIR/tunnels.db
+  ip tunnel del "$TUN" 2>/dev/null
+  sed -i "/^$TUN /d" "$DB"
 
-  echo "🗑️ تانل حذف شد"
+  ok "تونل حذف شد"
 }
 
-change_ip() {
+check_tunnel() {
   list_tunnels
-  read -p "نام تانل: " TUN
-  read -p "IP جدید ایران: " IR
+  read -p "نام تونل: " TUN
 
-  OLD=$(grep "^$TUN " $CONF_DIR/tunnels.db)
-  OUT_IP=$(echo $OLD | awk '{print $3}')
-  IPV6=$(echo $OLD | awk '{print $4}')
+  ROW=$(grep "^$TUN " "$DB") || die "تونل پیدا نشد"
+  IPV6_NET=$(echo "$ROW" | awk '{print $4}')
 
-  ip tunnel del $TUN 2>/dev/null
-
-  if [ "$ROLE" = "IR" ]; then
-    LOCAL=$IR
-    REMOTE=$OUT_IP
-    IPV6_LOCAL="${IPV6%/*}2/64"
+  if [[ "$ROLE" == "IR" ]]; then
+    TARGET="${IPV6_NET%/*}1"
   else
-    LOCAL=$OUT_IP
-    REMOTE=$IR
-    IPV6_LOCAL="${IPV6%/*}1/64"
+    TARGET="${IPV6_NET%/*}2"
   fi
 
-  ip tunnel add $TUN mode sit local $LOCAL remote $REMOTE ttl 255
-  ip link set $TUN up
-  ip -6 addr add $IPV6_LOCAL dev $TUN
-
-  sed -i "/^$TUN /d" $CONF_DIR/tunnels.db
-  echo "$TUN $IR $OUT_IP $IPV6" >> $CONF_DIR/tunnels.db
-
-  echo "🔁 IP ایران بروزرسانی شد و تونل مجدد ساخته شد"
+  health_check "$TUN" "$TARGET"
 }
 
+# ---------- UI ----------
 menu() {
-  echo "======================"
-  echo "  SIT / 6to4 Manager"
-  echo "======================"
-  echo "1) ساخت تانل"
-  echo "2) لیست تانل‌ها"
-  echo "3) حذف تانل"
-  echo "4) تغییر IP ایران تانل"
-  echo "0) خروج"
+  clear
+  echo -e "\e[35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
+  echo -e "\e[1;35m   🚀 SIT / 6to4 Tunnel Manager\e[0m"
+  echo -e "\e[35m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\e[0m"
+  echo "1) ➕ ساخت تونل جدید"
+  echo "2) 📡 لیست تونل‌ها"
+  echo "3) 🧪 تست سلامت تونل"
+  echo "4) 🗑️ حذف تونل"
+  echo "0) 🚪 خروج"
+  echo
 }
 
-### MAIN ###
+# ---------- MAIN ----------
 check_root
-ROLE=$(detect_country)
+ROLE=$(detect_role)
 
-[ "$ROLE" = "IR" ] && echo "🇮🇷 سرور ایران" || echo "🌍 سرور خارج"
+[[ "$ROLE" == "IR" ]] && info "نقش سرور: 🇮🇷 ایران" || info "نقش سرور: 🌍 خارج"
 
 while true; do
   menu
   read -p "> " C
-  case $C in
+  case "$C" in
     1) create_tunnel ;;
-    2) list_tunnels ;;
-    3) delete_tunnel ;;
-    4) change_ip ;;
-    0) exit ;;
+    2) list_tunnels; read -p "Enter..." ;;
+    3) check_tunnel; read -p "Enter..." ;;
+    4) delete_tunnel; read -p "Enter..." ;;
+    0) exit 0 ;;
+    *) echo "گزینه نامعتبر"; sleep 1 ;;
   esac
 done
